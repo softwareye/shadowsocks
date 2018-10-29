@@ -60,14 +60,3 @@ mappings = {'chacha20': ChaCha20_Cipher}
 def get_cipher(method, passwd):
     cipher = mappings[method.lower()]
     return cipher(passwd)
-
-
-if __name__ == '__main__':
-    text = b'this is a text'
-    passwd = b'hello'
-    cipher = ChaCha20_Cipher(passwd)
-    ctext = cipher.encrypt(text)
-    print(ctext)
-    cipher = ChaCha20_Cipher(passwd)
-    mtext = cipher.decrypt(ctext)
-    print(mtext)

@@ -1,3 +1,0 @@
-
-class SocksError(Exception):
-    pass

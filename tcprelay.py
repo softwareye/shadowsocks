@@ -3,7 +3,6 @@ import struct
 import asyncio
 import random
 from enum import Enum
-from errors import SocksError
 from constants import Status, SocksAtype, SocksCmd, SocksMethod, SocksRep, SOCKS_VER
 from crypto import get_cipher
 from logger import log
@@ -17,13 +16,7 @@ class LocalTCP(asyncio.Protocol):
         self._handler = TCPHandler(transport, self._rservers)
 
     def data_received(self, data):
-        try:
-            self._handler.handle(data)
-        except SocksError:
-            self.close()
-
-    def close(self):
-        self._transport.close()
+        self._handler.handle(data)
 
 class RemoteTcp(asyncio.Protocol):
     def __init__(self, ltransport, cipher):
@@ -31,15 +24,18 @@ class RemoteTcp(asyncio.Protocol):
         self._ltransport = ltransport
 
     def data_received(self, data):
-        dec_data = self._cipher.decrypt(data)
-        self._ltransport.write(dec_data)
+        if self._ltransport:
+            data = self._cipher.decrypt(data)
+            self._ltransport.write(data)
 
 class TCPHandler(object):
     def __init__(self, transport, rservers):
         self._transport = transport
-        self._server = random.choice(rservers)
         self._rtransport = None
+        self._cipher = None
         self._status = Status.negotiate
+        self._rservers = rservers
+
 
     def handle(self, data):
         if self._status == Status.negotiate:
@@ -49,7 +45,30 @@ class TCPHandler(object):
         elif self._status == Status.stream:
             asyncio.create_task(self._stream(data))
         else:
-            raise SocksError
+            self.close()
+
+    def close(self):
+        self._status = Status.error
+        self._transport.close()
+        if self._rtransport:
+            self._transport.close()
+
+    async def _open_rserver(self):
+        loop = asyncio.get_running_loop()
+        server = random.choice(self._rservers)
+        method = server.method.lower()
+        passwd = server.passwd
+        dcipher = get_cipher(method, passwd)
+        remote = lambda: RemoteTcp(self._transport, dcipher)
+        try:
+            rtransport, _ = await loop.create_connection(remote, server.addr, server.port)
+        except OSError:
+            log.info(f'Remote connection {server.addr}:{server.port} failed.')
+            self.close()
+        else:
+            ecipher = get_cipher(method, passwd)
+            return rtransport, ecipher
+
 
     async def _negotiate(self, data):
         """
@@ -57,10 +76,11 @@ class TCPHandler(object):
         server => client: | VER | METHOD |
         """
         if data[0] != SOCKS_VER or data[1] != len(data[2:]):
-            raise SocksError
-        resp = struct.pack('!BB', SOCKS_VER, SocksMethod.no_auth.value)
-        self._transport.write(resp)
-        self._status = Status.request
+            self.close()
+        else:
+            resp = struct.pack('!BB', SOCKS_VER, SocksMethod.no_auth.value)
+            self._transport.write(resp)
+            self._status = Status.request
 
     async def _request(self, data):
         """
@@ -68,32 +88,23 @@ class TCPHandler(object):
         server => client: | VER | REP | RSV | ATYPE | BND.ADDR | BND.PORT |
         """
         cmd= data[1]
-        if cmd != SocksCmd.connect.value:
-            rep = SocksRep.cmd_not_support.value
         addr = self._resolve_addr(data)
-        if addr:
-            loop = asyncio.get_running_loop()
-            method = self._server.method.lower()
-            passwd = self._server.passwd
-            self._cipher = get_cipher(method, passwd)
-            dcipher = get_cipher(method, passwd)
-            remote = lambda: RemoteTcp(self._transport, dcipher)
-            try:
-                self._rtransport, _ = await loop.create_connection(remote, self._server.addr, self._server.port)
-                self._rtransport.write(self._cipher.encrypt(data[3:]))
-            except OSError:
-                rep = SocksRep.network_unreachable.value
-            else:
-                rep = SocksRep.succeeded.value
+        if cmd != SocksCmd.connect.value or not addr:
+            self.close()
         else:
-            rep =SocksRep.atype_not_support.value
-        resp = struct.pack('!4BIH', SOCKS_VER, rep, 0, 1, 0, 0)
-        self._transport.write(resp)
-        self._status = Status.stream
+            if not self._rtransport:
+                self._rtransport, self._cipher = await self._open_rserver()
+            self._rtransport.write(self._cipher.encrypt(data[3:]))
+            self._status = Status.stream
+            rep = SocksRep.succeeded.value
+            resp = struct.pack('!4BIH', SOCKS_VER, rep, 0, 1, 0, 0)
+            self._transport.write(resp)
+
 
     async def _stream(self, data):
-        enc_data = self._cipher.encrypt(data)
-        self._rtransport.write(enc_data)
+        if self._rtransport:
+            data = self._cipher.encrypt(data)
+            self._rtransport.write(data)
 
     def _resolve_addr(self, data):
         atype = data[3]
